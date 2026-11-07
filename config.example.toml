@@ -1,0 +1,10 @@
+# Runtime file references. These paths contain no secret values.
+# Paths may be absolute, relative to this config file, or start with ~/.
+api_key_file = "/run/secrets/api_keys/bybit/api_key"
+api_secret_file = "/run/secrets/api_keys/bybit/api_secret"
+base_url = "https://api.bybit.com"
+
+# Alternative: remove the matching *_file field before using an inline value.
+# Keep inline credentials in a private runtime config, never in Nix source.
+# api_key = "REPLACE_WITH_YOUR_API_KEY"
+# api_secret = "REPLACE_WITH_YOUR_API_SECRET"

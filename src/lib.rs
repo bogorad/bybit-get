@@ -8,15 +8,23 @@ use config::load_config;
 use std::io::Write;
 use std::sync::{atomic::AtomicBool, Arc};
 
-pub const USAGE: &str = "Usage: bybit-get [--all | --cards | LAST4] [--config PATH]\n\n\
+pub const USAGE: &str =
+    "Usage: bybit-get [--all | --cards | LAST4] [--pages N] [--since MS] [--config PATH]\n\n\
   no action     Print this help without reading config or credentials.\n\
   --all         Print all available Card transaction events as a JSON array.\n\
   LAST4         Print all events for that card (exactly four ASCII digits).\n\
+  --pages N     With --all or LAST4: fetch only the newest N pages (50 events each)\n\
+                per category and stop; N is 1 to 10000. Meant for pollers.\n\
+  --since MS    With --all or LAST4: keep only events created at or after MS (Unix\n\
+                milliseconds, inclusive). Read pages newest first, per category, and\n\
+                stop after the first page with an older event. With --pages, the read\n\
+                ends at whichever limit comes first. Meant for pollers.\n\
   --cards       Print sorted card endings found in transaction history.\n\
   --help, -h    Show this help without reading config or credentials.\n\
   --version     Show the program version.\n\n\
 Authorization, reversal, financial, and refund events are included.\n\
-Output is written only after every requested category has been retrieved.\n\n\
+Output is written only after every requested category has been retrieved.\n\
+With --pages or --since, the result is partial: it holds the newest events only.\n\n\
 Default config: ~/.config/bybit-get/config.toml\n\
 Default credentials: /run/secrets/api_keys/bybit/api_key and api_secret.\n\
 Environment overrides: BYBIT_API_KEY_FILE, BYBIT_API_SECRET_FILE, BYBIT_BASE_URL.\n";
@@ -71,7 +79,7 @@ where
                 Action::Last4(value) => Some(value.as_str()),
                 _ => None,
             };
-            let records = match client.fetch_all(filter) {
+            let records = match client.fetch(filter, parsed.pages, parsed.since) {
                 Ok(value) => value,
                 Err(message) => {
                     let _ = writeln!(stderr, "bybit-get: {message}");

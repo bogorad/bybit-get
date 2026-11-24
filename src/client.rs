@@ -281,12 +281,16 @@ impl BybitClient {
         category: &str,
         filter: Option<&str>,
         end: i64,
+        max_pages: Option<usize>,
+        since: Option<i64>,
     ) -> Result<Vec<Transaction>, String> {
         let mut records = Vec::new();
         let mut seen = HashSet::new();
         let mut fetched: u64 = 0;
         let mut expected = None;
-        for page in 1..=MAX_PAGES {
+        let poll = max_pages.is_some() || since.is_some();
+        let page_limit = max_pages.unwrap_or(MAX_PAGES);
+        for page in 1..=page_limit {
             self.wait_for_card()?;
             let stamp = self.server_time()?;
             let mut payload = serde_json::json!({"page": page, "limit": 50, "type": category, "createEndTime": end});
@@ -307,7 +311,7 @@ impl BybitClient {
                 .and_then(|raw| strict_integer(raw))
                 .filter(|total| *total >= 0)
                 .ok_or_else(|| format!("{category} page {page}: invalid totalCount"))?;
-            if expected.is_some_and(|expected| expected != total) {
+            if !poll && expected.is_some_and(|expected| expected != total) {
                 return Err(format!(
                     "{category}: totalCount changed during pagination; retry the full query"
                 ));
@@ -318,16 +322,30 @@ impl BybitClient {
                 .and_then(|raw| serde_json::from_str(raw.get()).ok())
                 .ok_or_else(|| format!("{category} page {page}: missing or invalid data list"))?;
             let empty = data.is_empty();
+            let mut older = false;
             for raw in data {
                 let record = parse_transaction(raw, filter)
                     .map_err(|message| format!("{category} page {page}: {message}"))?;
                 fetched += 1;
+                if since.is_some_and(|since| record.created < since) {
+                    // Pages run newest first: this page is the last one needed.
+                    older = true;
+                    continue;
+                }
                 let fingerprint = Sha256::digest(record.canonical.as_bytes());
                 // Exact repeats in one category are kept once; the raw row
                 // still counts toward totalCount so pagination terminates.
                 if seen.insert(fingerprint) {
                     records.push(record);
                 }
+            }
+            if poll {
+                // Poll mode reads only the newest pages. An exhausted category,
+                // an event older than --since, or the page limit ends the loop.
+                if fetched >= total as u64 || empty || older {
+                    return Ok(records);
+                }
+                continue;
             }
             if fetched > total as u64 {
                 return Err(format!("{category}: returned more records than totalCount"));
@@ -341,15 +359,28 @@ impl BybitClient {
                 ));
             }
         }
+        if poll {
+            return Ok(records);
+        }
         Err(format!("{category}: pagination exceeded the safety bound"))
     }
 
-    pub fn fetch_all(&mut self, filter: Option<&str>) -> Result<Vec<Transaction>, String> {
+    /// Fetches transactions. With `max_pages` or `since` (poll mode), reads the
+    /// newest pages of each category first, at most `max_pages` of them, and
+    /// stops after the first page holding an event created before `since`.
+    /// Only events with `created >= since` are returned. Full-history
+    /// completeness checks, which cannot hold for a partial read, are skipped.
+    pub fn fetch(
+        &mut self,
+        filter: Option<&str>,
+        max_pages: Option<usize>,
+        since: Option<i64>,
+    ) -> Result<Vec<Transaction>, String> {
         let end = self.server_time()?;
         let mut records = Vec::new();
         let mut seen = HashSet::new();
         for category in CATEGORIES {
-            for record in self.fetch_category(category, filter, end)? {
+            for record in self.fetch_category(category, filter, end, max_pages, since)? {
                 if seen.insert(Sha256::digest(record.canonical.as_bytes())) {
                     records.push(record);
                 }
@@ -402,6 +433,9 @@ fn parse_transaction(raw: Box<RawValue>, filter: Option<&str>) -> Result<Transac
 
 #[cfg(test)]
 impl BybitClient {
+    pub(crate) fn fetch_all(&mut self, filter: Option<&str>) -> Result<Vec<Transaction>, String> {
+        self.fetch(filter, None, None)
+    }
     pub(crate) fn test_fast(&mut self) {
         self.min_card_interval = Duration::ZERO;
     }

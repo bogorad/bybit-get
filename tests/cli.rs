@@ -21,7 +21,7 @@ fn no_args_help_and_version_succeed_with_inaccessible_configuration() {
         assert!(output.stderr.is_empty());
         let text = String::from_utf8(output.stdout).unwrap();
         assert!(if args == vec!["--version"] {
-            text == "bybit-get 0.1.1\n"
+            text == "bybit-get 0.1.2\n"
         } else {
             text.contains("Usage:")
         });

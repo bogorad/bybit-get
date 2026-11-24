@@ -705,3 +705,448 @@ fn stalled_network_requests_have_a_deadline() {
     assert!(client.fetch_all(None).err().unwrap().contains("timed out"));
     assert!(start.elapsed() < Duration::from_millis(200));
 }
+
+fn args(values: &[&str]) -> Vec<OsString> {
+    values.iter().map(OsString::from).collect()
+}
+
+#[test]
+fn pages_option_parsing_accepts_only_all_or_card_with_a_valid_count() {
+    let parsed = cli::parse(args(&["--pages", "3", "--all"])).unwrap();
+    assert_eq!((parsed.action, parsed.pages), (Action::All, Some(3)));
+    let parsed = cli::parse(args(&["0042", "--pages", "1"])).unwrap();
+    assert_eq!(
+        (parsed.action, parsed.pages),
+        (Action::Last4("0042".into()), Some(1))
+    );
+    assert_eq!(cli::parse(args(&["--all"])).unwrap().pages, None);
+    // Help and version win and do not need a data action.
+    assert_eq!(
+        cli::parse(args(&["--pages", "2", "--help"]))
+            .unwrap()
+            .action,
+        Action::Help
+    );
+    assert_eq!(
+        cli::parse(args(&["--version", "--pages", "2"]))
+            .unwrap()
+            .action,
+        Action::Version
+    );
+    for bad in [
+        vec!["--all", "--pages"],
+        vec!["--all", "--pages", "0"],
+        vec!["--all", "--pages", "-1"],
+        vec!["--all", "--pages", "+1"],
+        vec!["--all", "--pages", "1x"],
+        vec!["--all", "--pages", ""],
+        vec!["--all", "--pages", "10001"],
+        vec!["--all", "--pages", "99999999999999999999999"],
+        vec!["--all", "--pages", "--config", "x"],
+        vec!["--all", "--pages", "1", "--pages", "2"],
+        vec!["--cards", "--pages", "1"],
+        vec!["--pages", "1"],
+    ] {
+        assert!(cli::parse(args(&bad)).is_err(), "{bad:?}");
+    }
+    assert_eq!(
+        cli::parse(args(&["--all", "--pages", "10000"]))
+            .unwrap()
+            .pages,
+        Some(10000)
+    );
+}
+
+#[test]
+fn poll_mode_reads_at_most_n_pages_per_category_and_stops_early() {
+    // AUTH_ALL has 3 pages of data; FINANCIAL_ALL has one short page; the others
+    // are empty. With --pages 2 the third AUTH_ALL page must not be requested.
+    let (server, calls) = fake(|category, _, number| match category {
+        "SIDE_QUERY_AUTH_ALL" => page(
+            json!(150),
+            (0..50)
+                .map(|n| {
+                    fixture(
+                        &format!("a{number}-{n}"),
+                        "1234",
+                        1000 - number as i64 * 100 + n,
+                    )
+                })
+                .collect(),
+        ),
+        "SIDE_QUERY_FINANCIAL_ALL" => page(json!(1), vec![fixture("f", "1234", 5000)]),
+        _ => page(json!(0), vec![]),
+    });
+    let records = server.client().fetch(None, Some(2), None).unwrap();
+    assert_eq!(records.len(), 101);
+    let calls = calls.lock().unwrap();
+    // 2 AUTH_ALL pages + 1 per other category.
+    assert_eq!(calls.card, 5);
+    assert_eq!(
+        calls
+            .categories
+            .iter()
+            .filter(|c| *c == "SIDE_QUERY_AUTH_ALL")
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn poll_mode_one_page_sends_page_one_and_keeps_sort_and_output_format() {
+    let newer = fixture("n", "1234", 300);
+    let older = fixture("o", "1234", 100);
+    let (server, calls) = fake(move |category, _, number| {
+        assert_eq!(number, 1, "only page 1 may be requested");
+        match category {
+            "SIDE_QUERY_AUTH_ALL" => page(json!(500), vec![older.clone(), newer.clone()]),
+            _ => page(json!(0), vec![]),
+        }
+    });
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let code = execute_with_client(args(&["--all", "--pages", "1"]), &mut out, &mut err, |_| {
+        Ok(server.client())
+    });
+    assert_eq!(code, 0, "{}", String::from_utf8_lossy(&err));
+    assert!(err.is_empty());
+    let decoded: Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(decoded.as_array().unwrap().len(), 2);
+    assert_eq!(decoded[0]["txnId"], "n");
+    assert_eq!(decoded[1]["txnId"], "o");
+    assert!(out.ends_with(b"]\n"));
+    assert_eq!(calls.lock().unwrap().card, 4);
+}
+
+#[test]
+fn poll_mode_skips_only_full_history_completeness_errors() {
+    // Changed totalCount between pages, overshoot, and an empty page before
+    // totalCount are fatal in a full fetch. They must not fail a partial one.
+    // Each fetch uses a fresh fixture server (the fixture clock is stateful).
+    let changed = || {
+        fake(|category, _, number| {
+            if category != CATEGORIES[0] {
+                return page(json!(0), vec![]);
+            }
+            match number {
+                1 => page(json!(100), vec![fixture("a", "1234", 10)]),
+                2 => page(json!(101), vec![fixture("b", "1234", 20)]),
+                _ => page(json!(3), vec![fixture("c", "1234", 30)]),
+            }
+        })
+    };
+    let (server, _) = changed();
+    assert!(server.client().fetch(None, None, None).is_err());
+    let (server, _) = changed();
+    assert_eq!(server.client().fetch(None, Some(3), None).unwrap().len(), 3);
+
+    let overshoot = || {
+        fake(|category, _, _| {
+            if category == CATEGORIES[0] {
+                page(
+                    json!(1),
+                    vec![fixture("a", "1234", 10), fixture("b", "1234", 20)],
+                )
+            } else {
+                page(json!(0), vec![])
+            }
+        })
+    };
+    let (server, _) = overshoot();
+    assert!(server.client().fetch(None, None, None).is_err());
+    let (server, _) = overshoot();
+    assert_eq!(server.client().fetch(None, Some(1), None).unwrap().len(), 2);
+
+    // Empty page although totalCount promises more.
+    let empty_early = || {
+        fake(|category, _, number| {
+            if category == CATEGORIES[0] && number == 1 {
+                page(json!(100), vec![fixture("a", "1234", 10)])
+            } else if category == CATEGORIES[0] {
+                page(json!(100), vec![])
+            } else {
+                page(json!(0), vec![])
+            }
+        })
+    };
+    let (server, _) = empty_early();
+    assert!(server.client().fetch(None, None, None).is_err());
+    let (server, calls) = empty_early();
+    assert_eq!(server.client().fetch(None, Some(5), None).unwrap().len(), 1);
+    // AUTH_ALL stops at its empty page 2; three other categories take one call.
+    assert_eq!(calls.lock().unwrap().card, 5);
+}
+
+#[test]
+fn poll_mode_keeps_record_validation_and_exact_duplicate_rule() {
+    // Exact duplicates are kept once, in a page and across pages.
+    let a = fixture("a", "1234", 10);
+    let (server, _) = fake(move |category, _, _| {
+        if category == CATEGORIES[0] {
+            page(json!(100), vec![a.clone(), a.clone()])
+        } else {
+            page(json!(0), vec![])
+        }
+    });
+    assert_eq!(server.client().fetch(None, Some(2), None).unwrap().len(), 1);
+
+    // Malformed totalCount, missing card ending, bad timestamp, bad data list.
+    for bad_page in [
+        json!({"totalCount": "x", "data": []}),
+        json!({"totalCount": -1, "data": []}),
+        json!({"totalCount": 1, "data": {}}),
+        json!({"totalCount": 1, "data": [{"txnCreate": 1}]}),
+        json!({"totalCount": 1, "data": [{"pan4": "1234"}]}),
+        json!({"totalCount": 1, "data": [fixture("a", "12x4", 1)]}),
+        json!({"totalCount": 1, "data": [7]}),
+    ] {
+        let (server, _) = fake(move |_, _, _| bad_page.clone());
+        assert!(server.client().fetch(None, Some(1), None).is_err());
+    }
+
+    // The card filter is still sent and re-checked.
+    let (server, calls) = fake(|category, _, _| {
+        if category == CATEGORIES[0] {
+            page(json!(1), vec![fixture("a", "9999", 10)])
+        } else {
+            page(json!(0), vec![])
+        }
+    });
+    let error = server
+        .client()
+        .fetch(Some("1234"), Some(1), None)
+        .err()
+        .unwrap();
+    assert!(error.contains("different card"));
+    assert_eq!(calls.lock().unwrap().filters[0].as_deref(), Some("1234"));
+}
+
+#[test]
+fn since_option_parsing() {
+    let parsed = cli::parse(args(&["--all", "--since", "1700000000000", "--pages", "3"])).unwrap();
+    assert_eq!((parsed.since, parsed.pages), (Some(1700000000000), Some(3)));
+    assert_eq!(
+        cli::parse(args(&["0042", "--since", "0"])).unwrap().since,
+        Some(0)
+    );
+    assert_eq!(cli::parse(args(&["--all"])).unwrap().since, None);
+    assert_eq!(
+        cli::parse(args(&["--since", "5", "--help"]))
+            .unwrap()
+            .action,
+        Action::Help
+    );
+    for bad in [
+        vec!["--all", "--since"],
+        vec!["--all", "--since", "-1"],
+        vec!["--all", "--since", "+1"],
+        vec!["--all", "--since", "1.5"],
+        vec!["--all", "--since", "x"],
+        vec!["--all", "--since", ""],
+        vec!["--all", "--since", "99999999999999999999999"],
+        vec!["--all", "--since", "--config", "x"],
+        vec!["--all", "--since", "1", "--since", "2"],
+        vec!["--cards", "--since", "1"],
+        vec!["--since", "1"],
+    ] {
+        assert!(cli::parse(args(&bad)).is_err(), "{bad:?}");
+    }
+}
+
+/// AUTH_ALL: 3 pages of 50 events, newest first, stamps 1000 down to 851.
+/// Other categories are empty. Returns the fixture server and call log.
+fn descending_auth() -> (Server, Arc<Mutex<Calls>>) {
+    fake(|category, _, number| {
+        if category != CATEGORIES[0] {
+            return page(json!(0), vec![]);
+        }
+        let first = 1000 - (number as i64 - 1) * 50;
+        page(
+            json!(150),
+            (0..50)
+                .map(|n| fixture(&format!("t{}", first - n), "1234", first - n))
+                .collect(),
+        )
+    })
+}
+
+fn auth_pages(calls: &Arc<Mutex<Calls>>) -> usize {
+    calls
+        .lock()
+        .unwrap()
+        .categories
+        .iter()
+        .filter(|c| *c == CATEGORIES[0])
+        .count()
+}
+
+#[test]
+fn since_stops_after_the_first_page_with_an_older_event() {
+    // Bound 960 lies inside page 1 (stamps 1000..951): keep 960..1000, 41 events,
+    // and do not request page 2.
+    let (server, calls) = descending_auth();
+    let records = server.client().fetch(None, None, Some(960)).unwrap();
+    assert_eq!(records.len(), 41);
+    assert!(records.iter().all(|r| r.raw.get().contains("txnCreate")));
+    assert_eq!(auth_pages(&calls), 1);
+    assert_eq!(calls.lock().unwrap().card, 4);
+
+    // Bound 940 lies inside page 2 (stamps 950..901): page 2 is needed, page 3 is not.
+    let (server, calls) = descending_auth();
+    let records = server.client().fetch(None, None, Some(940)).unwrap();
+    assert_eq!(records.len(), 61);
+    assert_eq!(auth_pages(&calls), 2);
+}
+
+#[test]
+fn since_bound_is_inclusive_and_a_tie_at_the_bound_continues_to_the_next_page() {
+    // Bound 951 is the oldest stamp of page 1. Nothing on page 1 is older, so
+    // page 2 is read (a tie could continue there); its first event is older.
+    let (server, calls) = descending_auth();
+    let records = server.client().fetch(None, None, Some(951)).unwrap();
+    assert_eq!(records.len(), 50);
+    assert_eq!(auth_pages(&calls), 2);
+    let stamps: Vec<i64> = records
+        .iter()
+        .map(|r| {
+            serde_json::from_str::<Value>(r.raw.get()).unwrap()["txnCreate"]
+                .as_i64()
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(stamps.iter().min(), Some(&951));
+
+    // A tie that continues over the page boundary is kept on both pages.
+    let (server, calls) = fake(|category, _, number| {
+        if category != CATEGORIES[0] {
+            return page(json!(0), vec![]);
+        }
+        match number {
+            1 => page(
+                json!(120),
+                (0..50)
+                    .map(|n| fixture(&format!("p1-{n}"), "1234", 500))
+                    .collect(),
+            ),
+            2 => page(
+                json!(120),
+                (0..50)
+                    .map(|n| fixture(&format!("p2-{n}"), "1234", if n < 10 { 500 } else { 499 }))
+                    .collect(),
+            ),
+            _ => page(json!(120), vec![fixture("p3", "1234", 1)]),
+        }
+    });
+    let records = server.client().fetch(None, None, Some(500)).unwrap();
+    assert_eq!(records.len(), 60);
+    assert_eq!(auth_pages(&calls), 2);
+}
+
+#[test]
+fn since_newer_than_everything_returns_nothing_and_old_bound_reads_all_pages() {
+    let (server, calls) = descending_auth();
+    assert!(server
+        .client()
+        .fetch(None, None, Some(5000))
+        .unwrap()
+        .is_empty());
+    assert_eq!(auth_pages(&calls), 1);
+
+    // A bound older than every event reads the whole category and stops at totalCount.
+    let (server, calls) = descending_auth();
+    assert_eq!(
+        server.client().fetch(None, None, Some(0)).unwrap().len(),
+        150
+    );
+    assert_eq!(auth_pages(&calls), 3);
+}
+
+#[test]
+fn pages_cap_and_since_stop_at_whichever_comes_first() {
+    // Cap first: bound 0 would read 3 pages, the cap stops at 2.
+    let (server, calls) = descending_auth();
+    assert_eq!(
+        server.client().fetch(None, Some(2), Some(0)).unwrap().len(),
+        100
+    );
+    assert_eq!(auth_pages(&calls), 2);
+
+    // Bound first: page 1 holds an older event, so the cap of 3 is not reached.
+    let (server, calls) = descending_auth();
+    assert_eq!(
+        server
+            .client()
+            .fetch(None, Some(3), Some(990))
+            .unwrap()
+            .len(),
+        11
+    );
+    assert_eq!(auth_pages(&calls), 1);
+}
+
+#[test]
+fn since_mode_keeps_validation_duplicates_and_skips_completeness_errors() {
+    // Changed totalCount and overshoot do not fail; exact repeats are kept once.
+    let a = fixture("a", "1234", 100);
+    let (server, _) = fake(move |category, _, number| {
+        if category != CATEGORIES[0] {
+            return page(json!(0), vec![]);
+        }
+        match number {
+            1 => page(json!(500), vec![a.clone(), a.clone()]),
+            _ => page(
+                json!(1),
+                vec![fixture("b", "1234", 90), fixture("c", "1234", 80)],
+            ),
+        }
+    });
+    // Bound 85 keeps a (once) and b; c is older and ends the read on page 2.
+    assert_eq!(
+        server.client().fetch(None, None, Some(85)).unwrap().len(),
+        2
+    );
+
+    // Validation still applies to events older than the bound.
+    let (server, _) = fake(|category, _, _| {
+        if category == CATEGORIES[0] {
+            page(json!(1), vec![fixture("z", "12x4", 1)])
+        } else {
+            page(json!(0), vec![])
+        }
+    });
+    assert!(server.client().fetch(None, None, Some(100)).is_err());
+}
+
+#[test]
+fn since_end_to_end_output_keeps_format_and_sort() {
+    let (server, _) = fake(|category, _, _| match category {
+        "SIDE_QUERY_AUTH_ALL" => page(
+            json!(3),
+            vec![
+                fixture("n", "1234", 300),
+                fixture("m", "1234", 200),
+                fixture("o", "1234", 100),
+            ],
+        ),
+        "SIDE_QUERY_FINANCIAL_ALL" => page(json!(1), vec![fixture("f", "1234", 250)]),
+        _ => page(json!(0), vec![]),
+    });
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let code = execute_with_client(
+        args(&["--all", "--since", "200", "--pages", "2"]),
+        &mut out,
+        &mut err,
+        |_| Ok(server.client()),
+    );
+    assert_eq!(code, 0, "{}", String::from_utf8_lossy(&err));
+    let decoded: Value = serde_json::from_slice(&out).unwrap();
+    let ids: Vec<&str> = decoded
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v["txnId"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["n", "f", "m"]);
+    assert!(out.ends_with(b"]\n"));
+}

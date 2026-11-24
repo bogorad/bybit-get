@@ -13,8 +13,27 @@ bybit-get --version
 bybit-get --all           # All available transaction events, newest first
 bybit-get 0012            # All available events for the card ending in 0012
 bybit-get --cards         # Distinct card endings found in transaction history
+bybit-get --all --pages 1  # Poll mode: only the newest page (50 events) per category
+bybit-get --all --since 1763900000000 --pages 3  # Only events at or after that time
 bybit-get --config ./config.toml --all
 ```
+
+`--pages N` (1 to 10000) works with `--all` or a card filter. It fetches at most
+N pages per category, newest first, and stops early. The output has the same
+format and sort, but it is partial. It is meant for an unattended poller that
+keeps its own ledger; run a full `--all` now and then to reconcile. In this mode
+the full-history checks (changed `totalCount`, more rows than `totalCount`,
+empty page before `totalCount`) are skipped. Record validation and the
+keep-once rule for exact duplicates still apply.
+
+`--since MS` (Unix time in milliseconds, whole digits) keeps only events with
+`txnCreate` at or after `MS`; the bound is inclusive. Per category, the client
+reads pages newest first and stops after the first page that holds an older
+event. It is a client-side filter: no time parameter is sent to Bybit. A page
+whose oldest event equals `MS` does not stop the read, because more events with
+the same time can follow. With both options, whichever limit comes first ends
+the read (`--pages` is a hard cap). The same checks are skipped as for
+`--pages`. Neither option is valid with `--cards`.
 
 Use exactly four digits for a card filter. Leading zeros are preserved.
 `--cards` prints a sorted JSON array of last-four strings. It cannot discover
@@ -39,7 +58,7 @@ nix profile add github:bogorad/bybit-get
 Pin a release when you need a stable version:
 
 ```bash
-nix run github:bogorad/bybit-get/v0.1.1 -- --help
+nix run github:bogorad/bybit-get/v0.1.2 -- --help
 ```
 
 ### Linux release executable
@@ -62,7 +81,7 @@ AMD64 (`x86_64`) to match the machine. Ensure `~/.local/bin` is on your `PATH`.
 With a Rust toolchain installed:
 
 ```bash
-cargo install --git https://github.com/bogorad/bybit-get --tag v0.1.1 --locked
+cargo install --git https://github.com/bogorad/bybit-get --tag v0.1.2 --locked
 ```
 
 ## Configuration
@@ -135,7 +154,7 @@ example uses an existing Home Manager flake configuration:
       inputs.nixpkgs.follows = "nixpkgs";
     };
     bybit-get = {
-      url = "github:bogorad/bybit-get/v0.1.1";
+      url = "github:bogorad/bybit-get/v0.1.2";
       inputs.nixpkgs.follows = "nixpkgs";
     };
   };

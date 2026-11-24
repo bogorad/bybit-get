@@ -77,7 +77,7 @@
             "$program" --config "$TMPDIR/missing-config.toml" --help > explicit-help.txt
             cmp help.txt explicit-help.txt
             "$program" --version > version.txt
-            grep -Fx 'bybit-get 0.1.1' version.txt
+            grep -Fx 'bybit-get 0.1.2' version.txt
             mkdir -p "$out"
             cp help.txt version.txt "$out/"
           '';

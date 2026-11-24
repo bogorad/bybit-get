@@ -39,7 +39,7 @@ nix profile add github:bogorad/bybit-get
 Pin a release when you need a stable version:
 
 ```bash
-nix run github:bogorad/bybit-get/v0.1.0 -- --help
+nix run github:bogorad/bybit-get/v0.1.1 -- --help
 ```
 
 ### Linux release executable
@@ -62,7 +62,7 @@ AMD64 (`x86_64`) to match the machine. Ensure `~/.local/bin` is on your `PATH`.
 With a Rust toolchain installed:
 
 ```bash
-cargo install --git https://github.com/bogorad/bybit-get --tag v0.1.0 --locked
+cargo install --git https://github.com/bogorad/bybit-get --tag v0.1.1 --locked
 ```
 
 ## Configuration
@@ -135,7 +135,7 @@ example uses an existing Home Manager flake configuration:
       inputs.nixpkgs.follows = "nixpkgs";
     };
     bybit-get = {
-      url = "github:bogorad/bybit-get/v0.1.0";
+      url = "github:bogorad/bybit-get/v0.1.1";
       inputs.nixpkgs.follows = "nixpkgs";
     };
   };
@@ -182,9 +182,10 @@ later clearing are separate records; do not sum them as separate purchases.
 The CLI fixes one upper time boundary for the whole query and requests history
 without a lower time filter. Bybit retention limits still apply. Page size is
 50. Pagination follows `totalCount` even when a page is short. Changed totals,
-malformed responses, repeated identical records within a category, and
-incomplete pagination stop the query. The full result is buffered before JSON
-is written, so a failed request does not print a partial transaction array.
+malformed responses, and incomplete pagination stop the query. Exact duplicate
+records within a category are kept once, and each raw repeat still counts toward
+Bybit's `totalCount`. The full result is buffered before JSON is written, so a
+failed request does not print a partial transaction array.
 
 Exact duplicate records across overlapping categories are removed. Different
 records with the same transaction ID are retained. Card filtering is sent to

@@ -557,7 +557,6 @@ fn malformed_or_incomplete_pagination_fails() {
         "empty-early",
         "overshoot",
         "changing-total",
-        "repeated-record",
         "wrong-card",
         "bad-pan4",
         "bad-time",
@@ -577,7 +576,6 @@ fn malformed_or_incomplete_pagination_fails() {
                     json!(number + 1),
                     vec![fixture(&format!("{number}"), "1234", 10)],
                 ),
-                "repeated-record" => page(json!(2), vec![record]),
                 "wrong-card" => page(json!(1), vec![fixture("a", "9999", 10)]),
                 "bad-pan4" => page(json!(1), vec![fixture("a", "１２３４", 10)]),
                 _ => page(
@@ -595,6 +593,37 @@ fn malformed_or_incomplete_pagination_fails() {
         assert!(out.is_empty(), "partial stdout for {case}");
         assert!(!err.is_empty());
     }
+}
+
+#[test]
+fn exact_duplicate_within_category_is_kept_once_and_succeeds() {
+    // Bybit can repeat an identical record in one category; keep one copy.
+    // Across pages: totalCount counts the raw repeated row, so 2 pages end it.
+    let repeated = fixture("a", "1234", 10);
+    let (server, calls) = fake(move |category, _, _| {
+        if category == CATEGORIES[0] {
+            page(json!(2), vec![repeated.clone()])
+        } else {
+            page(json!(0), vec![])
+        }
+    });
+    let records = server.client().fetch_all(None).unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(calls.lock().unwrap().card, 5);
+
+    // Same page: [a, a, b] with totalCount 3 succeeds with two unique records.
+    let a = fixture("a", "1234", 10);
+    let b = fixture("b", "1234", 20);
+    let (server, calls) = fake(move |category, _, _| {
+        if category == CATEGORIES[0] {
+            page(json!(3), vec![a.clone(), a.clone(), b.clone()])
+        } else {
+            page(json!(0), vec![])
+        }
+    });
+    let records = server.client().fetch_all(None).unwrap();
+    assert_eq!(records.len(), 2);
+    assert_eq!(calls.lock().unwrap().card, 4);
 }
 
 #[test]

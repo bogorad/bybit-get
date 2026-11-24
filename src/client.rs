@@ -284,6 +284,7 @@ impl BybitClient {
     ) -> Result<Vec<Transaction>, String> {
         let mut records = Vec::new();
         let mut seen = HashSet::new();
+        let mut fetched: u64 = 0;
         let mut expected = None;
         for page in 1..=MAX_PAGES {
             self.wait_for_card()?;
@@ -320,16 +321,18 @@ impl BybitClient {
             for raw in data {
                 let record = parse_transaction(raw, filter)
                     .map_err(|message| format!("{category} page {page}: {message}"))?;
+                fetched += 1;
                 let fingerprint = Sha256::digest(record.canonical.as_bytes());
-                if !seen.insert(fingerprint) {
-                    return Err(format!("{category}: a transaction repeated during pagination; retry the full query"));
+                // Exact repeats in one category are kept once; the raw row
+                // still counts toward totalCount so pagination terminates.
+                if seen.insert(fingerprint) {
+                    records.push(record);
                 }
-                records.push(record);
             }
-            if records.len() as u64 > total as u64 {
+            if fetched > total as u64 {
                 return Err(format!("{category}: returned more records than totalCount"));
             }
-            if records.len() as u64 == total as u64 {
+            if fetched == total as u64 {
                 return Ok(records);
             }
             if empty {
